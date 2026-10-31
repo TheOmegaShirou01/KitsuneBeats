@@ -1,0 +1,131 @@
+
+name: Build Kitsune Beats APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build a test APK or signed release'
+        type: choice
+        options: [debug, release]
+        default: debug
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    env:
+      BUILD_TYPE: ${{ github.event_name == 'workflow_dispatch' && inputs.build_type || 'debug' }}
+      EXPECTED_SHA256: ${{ vars.KITSUNE_CERT_SHA256 }}
+
+    steps:
+      - name: Download repository
+        uses: actions/checkout@v4
+
+      - name: Unpack Kitsune Beats source
+        run: |
+          unzip -q KitsuneBeats-v0.2.0-GitHub-Actions-Complete-Project.zip -d source
+          test -f source/KitsuneBeats/app/build.gradle
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Test backend
+        working-directory: source/KitsuneBeats/backend
+        run: npm test
+
+      - name: Restore release signing key
+        if: env.BUILD_TYPE == 'release'
+        shell: bash
+        env:
+          KEY_B64: ${{ secrets.KITSUNE_KEYSTORE_BASE64 }}
+          STORE_PASS: ${{ secrets.KITSUNE_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KITSUNE_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.KITSUNE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for key in KEY_B64 STORE_PASS KEY_ALIAS KEY_PASS EXPECTED_SHA256; do
+            if [[ -z "${!key}" ]]; then
+              echo "Missing signing secret or certificate: $key" >&2
+              exit 1
+            fi
+          done
+          mkdir -p "$RUNNER_TEMP/kitsune-signing"
+          printf '%s' "$KEY_B64" | base64 --decode > "$RUNNER_TEMP/kitsune-signing/release.jks"
+          chmod 600 "$RUNNER_TEMP/kitsune-signing/release.jks"
+
+      - name: Build debug APK
+        if: env.BUILD_TYPE == 'debug'
+        working-directory: source/KitsuneBeats
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Build signed release APK
+        if: env.BUILD_TYPE == 'release'
+        working-directory: source/KitsuneBeats
+        env:
+          KITSUNE_SIGNING_STORE_FILE: ${{ runner.temp }}/kitsune-signing/release.jks
+          KITSUNE_SIGNING_STORE_PASSWORD: ${{ secrets.KITSUNE_STORE_PASSWORD }}
+          KITSUNE_SIGNING_KEY_ALIAS: ${{ secrets.KITSUNE_KEY_ALIAS }}
+          KITSUNE_SIGNING_KEY_PASSWORD: ${{ secrets.KITSUNE_KEY_PASSWORD }}
+        run: gradle --no-daemon :app:assembleRelease
+
+      - name: Verify release certificate
+        if: env.BUILD_TYPE == 'release'
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk='source/KitsuneBeats/app/build/outputs/apk/release/app-release.apk'
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "$apk" > "$RUNNER_TEMP/cert.txt"
+          actual="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/cert.txt" | head -1 | tr -d ': ' | tr '[:upper:]' '[:lower:]')"
+          expected="$(printf %s "$EXPECTED_SHA256" | tr -d ': ' | tr '[:upper:]' '[:lower:]')"
+          if [[ -z "$actual" || "$actual" != "$expected" ]]; then
+            echo 'Release signing certificate mismatch.' >&2
+            exit 1
+          fi
+
+      - name: Prepare downloadable APK
+        run: |
+          mkdir -p apk-download
+          if [[ "$BUILD_TYPE" == 'release' ]]; then
+            cp source/KitsuneBeats/app/build/outputs/apk/release/app-release.apk apk-download/KitsuneBeats-v0.2.0-release.apk
+          else
+            cp source/KitsuneBeats/app/build/outputs/apk/debug/app-debug.apk apk-download/KitsuneBeats-v0.2.0-debug.apk
+          fi
+          sha256sum apk-download/*.apk > apk-download/SHA256SUMS.txt
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: KitsuneBeats-v0.2.0-${{ env.BUILD_TYPE }}
+          path: apk-download/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Remove temporary signing key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/kitsune-signing"
+        
